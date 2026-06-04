@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# Generated output files — not tracked; recreated by running the script
+*.svg
+*.dxf
+*.png
+# LibreOffice lock files
+.~lock.*
