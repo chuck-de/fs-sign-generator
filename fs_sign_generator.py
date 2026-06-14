@@ -93,11 +93,16 @@ def _parse_line(text):
     elif re.search(r'(?<!\S)v\s*$', s):
         d['arrow'] = 'down';   s = re.sub(r'\s+v\s*$', '', s).strip()
 
-    # Distance: number/fraction at end, NOT after Trail/TR
+    # Distance: fraction or whole number at end.
+    # Exclude if preceded by '.' (decimal trail number like "NO. 2.1")
+    # or if the preceding word is Trail/TR/NO.
     m = re.search(r'\s+(\d+\s+\d+/\d+|\d+/\d+|\d+)\s*$', s)
     if m:
         before = s[:m.start()].strip()
-        if not re.search(r'\b(TRAIL NO.|TRAIL NUMBER|TR. NO.)\s*$', before, re.I):
+        char_before_space = s[m.start()-1] if m.start() > 0 else ''
+        is_decimal_part = char_before_space == '.'
+        is_trail_num = bool(re.search(r'\b(Trail|TR|NO\.)\s*$', before, re.I))
+        if not is_decimal_part and not is_trail_num:
             d['distance'] = m.group(1).strip()
             s = before
 
@@ -395,6 +400,136 @@ def _dxf_arrow(msp, direction, x, y_bottom, w, h):
 
     msp.add_lwpolyline(verts, close=True, dxfattribs={'layer':'ARROWS'})
 
+# ── CRV template patching ────────────────────────────────────────────────────
+def _crv_find_stream_sectors(raw, stream_name_fragment):
+    """Return (sector_ids, stream_size, dir_size_offset) for an OLE2 stream."""
+    import struct
+    assert raw[:8] == b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1', "Not an OLE2 file"
+    SS = 512
+
+    # Build FAT from DIFAT table in header
+    difat = struct.unpack_from('<109I', raw, 76)
+    fat = []
+    for sid in difat:
+        if sid >= 0xFFFFFFFC:
+            break
+        off = (sid + 1) * SS
+        fat.extend(struct.unpack_from(f'<{SS//4}I', raw, off))
+
+    # Walk directory
+    first_dir = struct.unpack_from('<I', raw, 48)[0]
+    dir_sectors = []
+    s = first_dir
+    while s < 0xFFFFFFFC:
+        dir_sectors.append(s)
+        s = fat[s]
+
+    # Search directory entries for our stream
+    frag = stream_name_fragment.encode('utf-16-le')
+    for ds in dir_sectors:
+        base = (ds + 1) * SS
+        for i in range(4):
+            off = base + i * 128
+            entry = raw[off:off+128]
+            name_len = struct.unpack_from('<H', entry, 64)[0]
+            if name_len < 2:
+                continue
+            name_bytes = entry[:name_len-2]
+            if frag in name_bytes:
+                start = struct.unpack_from('<I', entry, 116)[0]
+                size  = struct.unpack_from('<I', entry, 120)[0]
+                dir_size_off = off + 120
+                # Follow FAT chain
+                sectors = []
+                sec = start
+                while sec < 0xFFFFFFFC:
+                    sectors.append(sec)
+                    sec = fat[sec] if sec < len(fat) else 0xFFFFFFFE
+                return sectors, size, dir_size_off
+
+    raise ValueError(f"Stream '{stream_name_fragment}' not found in OLE2 file")
+
+
+def patch_crv(template_path, output_path, replacements):
+    """
+    Copy template .crv and replace _txtAL_Text values in order.
+    replacements: list of (old_text, new_text) strings.
+    """
+    import struct
+
+    with open(template_path, 'rb') as f:
+        raw = bytearray(f.read())
+
+    sectors, stream_size, dir_size_off = _crv_find_stream_sectors(raw, '2dDataV2')
+    SS = 512
+    allocated = len(sectors) * SS
+
+    # Read stream data from raw file
+    stream = bytearray()
+    for sid in sectors:
+        stream.extend(raw[(sid+1)*SS : (sid+1)*SS + SS])
+    stream = stream[:stream_size]
+
+    # Apply replacements in order — find each _txtAL_Text occurrence sequentially
+    needle = '_txtAL_Text'.encode('utf-16-le')
+    search_from = 0
+    rep_idx = 0
+
+    while rep_idx < len(replacements):
+        old_text, new_text = replacements[rep_idx]
+        idx = stream.find(needle, search_from)
+        if idx < 0:
+            print(f'Warning: ran out of _txtAL_Text fields (needed {len(replacements)}, found {rep_idx})')
+            break
+        after = idx + len(needle)
+        if stream[after:after+7] != b'\x03\x00\x00\x00\xff\xfe\xff':
+            search_from = idx + 2
+            continue  # skip non-string fields
+
+        old_len = stream[after+7]
+        old_utf16 = stream[after+8 : after+8+old_len*2]
+        found_text = old_utf16.decode('utf-16-le')
+
+        new_utf16 = new_text.encode('utf-16-le')
+        new_len = len(new_text)
+        assert new_len <= 255, f"Text too long (max 255 chars): {new_text}"
+
+        # Build replacement bytes for the value (keep field name)
+        new_value = b'\x03\x00\x00\x00\xff\xfe\xff' + bytes([new_len]) + new_utf16
+        old_value = b'\x03\x00\x00\x00\xff\xfe\xff' + bytes([old_len]) + bytes(old_utf16)
+
+        stream[after:after+len(old_value)] = new_value
+        # Adjust if lengths differ
+        delta = len(new_value) - len(old_value)
+        if delta != 0:
+            # new_value was already spliced; nothing extra needed since bytearray handles it
+            pass
+
+        print(f'  [{rep_idx+1}] "{found_text}" → "{new_text}"')
+        search_from = after + len(new_value)
+        rep_idx += 1
+
+    # Verify it fits
+    if len(stream) > allocated:
+        raise ValueError(
+            f"Modified stream ({len(stream)} bytes) exceeds allocated space "
+            f"({allocated} bytes). Choose a template with longer original text."
+        )
+
+    # Write stream back to sectors (pad last sector with zeros)
+    padded = stream + bytearray(allocated - len(stream))
+    for i, sid in enumerate(sectors):
+        off = (sid+1) * SS
+        raw[off:off+SS] = padded[i*SS:(i+1)*SS]
+
+    # Update stream size in directory entry
+    struct.pack_into('<I', raw, dir_size_off, len(stream))
+
+    with open(output_path, 'wb') as f:
+        f.write(raw)
+    print(f'CRV written → {output_path}')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main(sign_text=None):
     if sign_text is None:
@@ -441,5 +576,78 @@ def main(sign_text=None):
     print('  HOLES         — 3/8" drill holes  depth .25"')
     print('  COUNTERSINK   — 3/4" countersink  depth .13"')
 
+def main_crv(template_path, sign_text, base_name):
+    """Patch a .crv template with new sign text."""
+    lines = parse_sign(sign_text)
+    print('Parsed lines:')
+    for i, ln in enumerate(lines):
+        print(f'  {i+1}: trail="{ln["trail"]}"  dist="{ln["distance"]}"  arrow="{ln["arrow"]}"')
+
+    # Build ordered list of (trail_name, distance) per non-continuation line
+    # matching the order text objects appear in the .crv: trail1, trail2... then distances
+    trail_texts = [ln['trail'] for ln in lines if ln['trail']]
+    dist_texts  = [ln['distance'] for ln in lines if ln['distance']]
+
+    # Read current values from template to build replacements
+    import olefile
+    ole = olefile.OleFileIO(template_path)
+    data = ole.openstream('VectorData/2dDataV2').read()
+    ole.close()
+
+    needle = '_txtAL_Text'.encode('utf-16-le')
+    template_texts = []
+    pos = 0
+    while True:
+        idx = data.find(needle, pos)
+        if idx < 0: break
+        after = idx + len(needle)
+        if data[after:after+7] == b'\x03\x00\x00\x00\xff\xfe\xff':
+            slen = data[after+7]
+            val = data[after+8:after+8+slen*2].decode('utf-16-le')
+            template_texts.append(val)
+        pos = idx + 2
+
+    new_texts = trail_texts + dist_texts
+    if len(new_texts) != len(template_texts):
+        print(f'Warning: template has {len(template_texts)} text objects, '
+              f'sign has {len(new_texts)}. Counts must match.')
+        print(f'  Template: {template_texts}')
+        print(f'  New:      {new_texts}')
+        return
+
+    replacements = list(zip(template_texts, new_texts))
+    out_path = f'{base_name}.crv'
+    patch_crv(template_path, out_path, replacements)
+
+    # Also generate SVG preview
+    sign_w, sign_h, positioned, content_w = layout(lines)
+    holes = hole_positions(sign_w, sign_h)
+    svg = generate_svg(sign_w, sign_h, positioned, content_w, holes)
+    svg_path = f'{base_name}.svg'
+    with open(svg_path, 'w') as f:
+        f.write(svg)
+    print(f'SVG preview  → {svg_path}')
+    print(f'Sign size: {sign_w:.3f}" W x {sign_h:.3f}" H')
+
+
 if __name__ == '__main__':
-    main(' '.join(sys.argv[1:]) if len(sys.argv) > 1 else None)
+    args = ' '.join(sys.argv[1:]) if len(sys.argv) > 1 else None
+
+    # Check for --template flag: --template path.crv "sign text"
+    if args and '--template' in args:
+        import argparse
+        p = argparse.ArgumentParser()
+        p.add_argument('--template', required=True)
+        p.add_argument('sign_text', nargs=argparse.REMAINDER)
+        parsed = p.parse_args()
+        sign_text = ' '.join(parsed.sign_text).strip()
+
+        base_name = 'output_sign'
+        m = re.match(r'^([^/:]+):\s*', sign_text)
+        if m:
+            base_name = m.group(1).strip()
+            sign_text = sign_text[m.end():]
+
+        main_crv(parsed.template, sign_text, base_name)
+    else:
+        main(args)
