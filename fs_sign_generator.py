@@ -97,7 +97,7 @@ def _parse_line(text):
     m = re.search(r'\s+(\d+\s+\d+/\d+|\d+/\d+|\d+)\s*$', s)
     if m:
         before = s[:m.start()].strip()
-        if not re.search(r'\b(Trail|TR)\s*$', before, re.I):
+        if not re.search(r'\b(TRAIL NO.|TRAIL NUMBER|TR. NO.)\s*$', before, re.I):
             d['distance'] = m.group(1).strip()
             s = before
 
@@ -270,6 +270,9 @@ def generate_dxf(sign_w, sign_h, positioned, content_w, holes, out_path):
     doc.header['$INSUNITS'] = 1  # inches
     msp = doc.modelspace()
 
+    # Text style — references Highway Gothic Narrow Bold when installed on the CNC machine
+    doc.styles.add('HGNB', font='HighwayGothicNarrow Bold.ttf')
+
     # Layers
     doc.layers.add('SIGN_OUTLINE', color=7)     # white
     doc.layers.add('TEXT_VCARVE',  color=1)     # red — v-carve text
@@ -289,43 +292,40 @@ def generate_dxf(sign_w, sign_h, positioned, content_w, holes, out_path):
     for ln, y_top in positioned:
         baseline_y = fy(y_top + LETTER_H * 0.82)
 
-        # Trail name
-        if ln['trail']:
-            msp.add_text(
-                ln['trail'],
-                dxfattribs={
-                    'layer': 'TEXT_VCARVE',
-                    'height': LETTER_H,
-                    'insert': (BORDER, baseline_y),
-                    'halign': 0,   # left
-                }
-            )
+        is_left = ln['arrow'] == 'left'
+        trail_x = BORDER + (ARROW_W + ARROW_GAP if is_left else 0)
 
-        # Distance
+        # Trail name — MTEXT, left-aligned
+        if ln['trail']:
+            mt = msp.add_mtext(ln['trail'], dxfattribs={
+                'layer': 'TEXT_VCARVE',
+                'char_height': LETTER_H,
+                'style': 'HGNB',
+                'attachment_point': 4,  # middle-left
+            })
+            mt.set_location((trail_x, baseline_y))
+
+        # Distance — MTEXT, right-aligned
         if ln['distance']:
             if ln['arrow'] == 'right':
                 dist_rx = right_edge - ARROW_W - DIST_ARR_GAP
-            elif ln['arrow']:
+            elif ln['arrow'] and not is_left:
                 dist_rx = right_edge - ARROW_W - ARROW_GAP
             else:
                 dist_rx = right_edge
 
-            t = msp.add_text(
-                ln['distance'],
-                dxfattribs={
-                    'layer': 'TEXT_VCARVE',
-                    'height': LETTER_H,
-                    'insert': (dist_rx, baseline_y),
-                    'halign': 2,   # right
-                    'align_point': (dist_rx, baseline_y),
-                }
-            )
+            mt = msp.add_mtext(ln['distance'], dxfattribs={
+                'layer': 'TEXT_VCARVE',
+                'char_height': LETTER_H,
+                'style': 'HGNB',
+                'attachment_point': 6,  # middle-right
+            })
+            mt.set_location((dist_rx, baseline_y))
 
         # Arrow geometry
         if ln['arrow']:
-            ax  = right_edge - ARROW_W
-            ayb = fy(y_top + LETTER_H)  # bottom in DXF space
-            ayt = fy(y_top)             # top in DXF space
+            ax  = BORDER if is_left else right_edge - ARROW_W
+            ayb = fy(y_top + LETTER_H)
             _dxf_arrow(msp, ln['arrow'], ax, ayb, ARROW_W, LETTER_H)
 
     # Mounting holes
